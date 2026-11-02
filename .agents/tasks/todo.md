@@ -6,7 +6,8 @@ Strategy: build the cheapest experiment that can **kill** the hypothesis first
 (Milestone 1, ~2 weeks). Only build PPO, GRPO, M5 and the game if it survives.
 
 Conventions for every PR:
-- Own branch, CI green (ruff, ruff format, mypy strict, pytest) before merge.
+- Own branch; local checks green before merge: `ruff check`, `ruff format --check`,
+  `mypy` (strict), `pytest`. There is no GitHub CI.
 - Tests first for anything with a hand-computable answer.
 - New deps go in the dependency group of the phase that needs them.
 - Classical baselines and LLM programs share ONE interface: `policy(obs) -> list[int]`.
@@ -22,7 +23,7 @@ Conventions for every PR:
   - `WarehouseConfig`: skus, capacity (> 0)
   - `SimConfig`: horizon T, warmup W < T, demand_history H, lead_time_history M
 - [x] Tests: validators reject L = 0, W ≥ T, empty SKU list
-- DoD: CI green under the new name
+- DoD: all local checks green under the new name
 
 ### PR 2 — Scene generator (CRN)
 - [ ] `scenes.py`: `Scene` (frozen dataclass): `demand[N,T]`, `lead_time[N,T]` (int arrays, keyed by **placement day**), family, seed, `change_point | None`, affected SKUs
@@ -51,7 +52,7 @@ Conventions for every PR:
 
 ### PR 5 — Frozen scenes, oracle, paired evaluator
 - [ ] Split seed ranges: train / val / in-dist test / held-out test
-- [ ] `scenes/manifest.json`: SHA-256 of each frozen scene's arrays (manifest committed, arrays regenerated); CI test checks drift
+- [ ] `scenes/manifest.json`: SHA-256 of each frozen scene's arrays (manifest committed, arrays regenerated); a pytest test checks drift
 - [ ] `policies/oracle.py`: hindsight (s,S) per scene, joint under capacity, piecewise around `change_point`; cached
 - [ ] `eval/evaluate.py` → per-scene CSV (cost + breakdown + validity); `eval/stats.py`: paired bootstrap CI, win rate, % gap closed (unclipped, flagged when gap < 2%)
 - [ ] `eval/report.py` + CLI `uv run reordergym eval ...` → markdown table naming the manifest hash

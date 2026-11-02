@@ -284,8 +284,8 @@ problems ("sim too easy" risk).
 
 - Val, in-dist test, and held-out test scenes are generated once, saved as `.npz`,
   and listed in `scenes/manifest.json` with SHA-256 per file.
-- A CI test regenerates them from seeds and checks the hashes: generator drift fails
-  CI.
+- A pytest test regenerates them from seeds and checks the hashes: generator drift
+  fails the test suite.
 - Every result file records the manifest hash it was computed on.
 
 ---
