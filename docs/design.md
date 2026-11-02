@@ -1,17 +1,16 @@
-# FabDispatch — End-to-End Design
+# ReorderGym — End-to-End Design
 
 Status: draft for review. Nothing here is implemented yet.
+Supersedes the FabDispatch design (recoverable from git commit `1cc089a`).
 
 ## 0. Research question
 
-> Can a masked-PPO dispatching policy reduce weighted tardiness and flow time
-> versus strong dispatching rules, and under which conditions (load, failures,
-> due-date tightness, urgent orders) does it help or hurt?
+> On supply-chain shocks the model never trained on, do inventory policies written
+> as code by an LLM generalize better than a neural RL policy or the textbook formula?
 
-Success = a trustworthy, paired comparison with uncertainty estimates — not "PPO wins".
-
-Scope disclaimer: a simplified, semiconductor-*inspired* job shop. Not a fab digital
-twin, not a real deployment.
+Success = a trustworthy, paired, held-out comparison with confidence intervals and
+readable winning programs. A negative result ("LLM programs do not transfer") is a
+valid outcome and gets reported the same way.
 
 ---
 
@@ -21,355 +20,363 @@ twin, not a real deployment.
 ScenarioSpec (Pydantic) + seed
         │
         ▼
-ScenarioGenerator ──► ScenarioInstance  (ALL exogenous randomness, pre-sampled)
-        │                  jobs, realized durations, failure schedules
+SceneGenerator ──► Scene (ALL randomness pre-sampled: demand[i,t], lead_time[i,t])
+        │                 frozen eval scenes are hashed into a manifest
         ▼
-Simulator (SimPy)  ◄── one core, shared by every policy
-   advance() -> Decision | None      apply(decision, job_id)
+Fast sim (trusted process)  ◄── one core, shared by every policy
+   obs_t ──► policy(obs) ──► orders_t
         │
-   ┌────┴─────────────────────────┐
-   ▼                              ▼
-RuleRunner (FIFO/SPT/EDD/ATCS)   FabDispatchEnv (Gymnasium)
-   │                              │  features + mask + reward
-   │                              ▼
-   │                         MaskablePPO training ──► MLflow (runs, checkpoints)
-   ▼                              │
-Evaluator  ◄──────────────────────┘   paired held-out scenarios, stress suites
-   │
+   ┌────┼──────────────┬───────────────────┬─────────────────────┐
+   ▼    ▼              ▼                   ▼                     ▼
+Classical    PPO (SB3)     Verifier (sandboxed      LLM generators:        Game
+baselines                  untrusted programs)      zero-shot, program     (Streamlit)
++ oracle                        │                   search, SFT+GRPO
+   │                            └── reward ─────────────┘
    ▼
-Report / Dashboard (Streamlit)        FastAPI inference service (frozen model,
-                                       rule fallback) ◄── simulator as client
+Evaluator: paired CRN scenes, train / in-dist test / held-out families, CIs
+   │
+   ├──► Sim results table (% gap closed)
+   └──► Real-trace judge (M5 demand replay) → sim-vs-real ranking agreement
 ```
 
-The single most important structural decision: **one simulator core with an
-`advance()/apply()` interface**. Rules, the Gym env, the evaluator, and the API
-client all drive the same loop, so the only thing that differs between policies is
-the choice of job. Nothing else may differ.
+Structural rule (same as FactorioGym): **one sim core, one obs schema, one cost
+function**. Every policy — formula, network, program, human player — sees the same
+observation and is charged by the same code. Only the decision differs.
 
 ---
 
-## 2. Domain model
+## 2. Simulator
 
-Time unit: minutes (float). All entities are Pydantic models (config) or plain
-dataclasses (hot-path runtime state) — Pydantic validation at boundaries, not in the
-inner loop.
+### 2.1 Entities and time
 
-| Entity | Fields (MVP) |
+Periodic review, one step = one day, horizon `T` (default 365), `N` SKUs (default 8)
+sharing one warehouse of capacity `C` units. Integer units.
+
+Per SKU `i`: unit cost `c_i`, holding cost `h_i` per unit-day, lost-sales penalty
+`p_i` per unit, fixed order cost `K_i` per order placed, scrap cost `x_i` per unit,
+max order `q_max_i`.
+
+### 2.2 Daily event order (fixed, documented, tested)
+
+1. **Receive** every outstanding order whose arrival day is `t`. Orders may cross.
+2. **Capacity check**: if total on-hand > `C`, the excess is scrapped *from today's
+   receipts*, split across SKUs proportionally to today's receipt quantities
+   (largest-remainder rounding, ties by SKU index). Charged `c_i + x_i` per unit.
+3. **Demand** `D[i,t]` is served from on-hand. Unmet demand is lost, charged `p_i`.
+4. **Holding** charged on end-of-day on-hand: `h_i · on_hand_i`.
+5. **Observe → decide**: the policy returns integer orders `q_i ∈ [0, q_max_i]`.
+   Each `q_i > 0` costs `K_i + c_i · q_i` and arrives on day `t + L[i,t]`.
+   Lead times are ≥ 1. An order placed tonight with lead time L is received in
+   step 1 of day `t + L`, *before* that day's demand, so it must cover L days of
+   demand (not L + 1). L = 1 is next-morning delivery.
+
+The capacity semantics above are exactly where the prototype's base-stock bug came
+from. They are written once, in the sim, and baselines must be capacity-aware
+against *this* definition (§5.1). A hand-traced test pins them down.
+
+### 2.3 End effects (anti-reward-hacking by construction)
+
+- **Policies never see `t` or `T`.** They see day-of-week only (needed for
+  seasonality). A policy cannot "stop ordering near the end" if it cannot tell
+  where the end is.
+- **Warm-up**: costs in days `[0, W)` (default W = 60) are excluded from scoring.
+  Initial state: on-hand = `μ_i · (L̄_i + 1)`, empty pipeline.
+- **Terminal valuation**: at `T`, on-hand and pipeline units are credited at `c_i`,
+  so ending with inventory is neither free nor penalised beyond holding cost.
+
+### 2.4 Cost accounting
+
+Total cost is the sum of five components, always reported separately:
+`purchase + holding + lost_sales + fixed + scrap` (minus terminal credit).
+Breakdowns are what expose hacks such as "never order, eat lost sales" or
+"flood the warehouse, eat scrap".
+
+---
+
+## 3. Randomness and common random numbers
+
+Every scene pre-samples, before simulation starts:
+
+| Array | Meaning |
 |---|---|
-| `ProductFamily` | id, route: list of `Operation` |
-| `Operation` | stage id, mean processing time per eligible machine |
-| `Machine` | id, stage id, speed factor, failure params, setup time on family change |
-| `Job` | id, family, release time `A_j`, due date `d_j`, weight `w_j`, op index |
-| `Decision` | time, machine id, candidate job ids (canonical order), mask |
+| `demand[i, t]` | demand for SKU i on day t |
+| `lead_time[i, t]` | lead time of an order for SKU i **placed on day t** |
 
-Routing: each family has 3–5 operations over 3 stages; one family has a re-entrant
-visit (e.g. stage 1 → 2 → 1 → 3) — the semiconductor-flavoured part.
+Keying lead time by *placement day* (not "the next order") means a policy's order
+timing cannot change the randomness it faces. Every policy faces identical draws on
+a scene. Streams come from `numpy.random.SeedSequence(seed).spawn(...)`.
 
-Due dates: `d_j = A_j + k · TWK_j`, where `TWK_j` is total expected work, `k` is the
-tightness knob (lower = tighter). Weights: e.g. {1: 70%, 2: 20%, 4: 10%}; urgent
-orders get high weight and small `k`.
+The sim is deterministic given a scene: same scene + same policy ⇒ identical
+trajectory (a test).
 
 ---
 
-## 3. Simulator
+## 4. Observation and policy interface
 
-### 3.1 Why SimPy, and how we use it
+### 4.1 Observation (no future leakage)
 
-SimPy supplies the clock, the event queue, timeouts, and `Process.interrupt()`
-(which models a breakdown well). We do **not** use `simpy.Resource` for machines: its
-queue discipline is fixed, and here the queue discipline is the policy. Machines are
-our own state objects; SimPy only schedules events.
+Plain Python data (dicts, lists, ints, floats) so it can cross a process boundary:
 
-Pausing for RL: dispatch requests are pushed onto a `pending` list. `advance()`
-calls `env.step()` until `pending` is non-empty or the event queue is empty. That
-gives Gym-style control without threads or callbacks.
+- **Static**: `n_skus`, `capacity`, per-SKU `c, h, p, K, x, q_max`, nominal lead time.
+- **Per SKU**: `on_hand`, `pipeline` as `(qty, days_since_placed)` pairs (arrival
+  day is *not* revealed), `demand_history` (last H = 56 days), `lead_time_history`
+  (realised lead times of the last M = 10 received orders).
+- **Global**: `day_of_week`, total on-hand.
 
-### 3.2 Event types
+Never observed: `t`, `T`, future demand, future lead times, the scene family.
 
-job release · operation complete · machine failure · machine repair · (later) urgent
-order injection.
+`lead_time_history` and `demand_history` are what make shock *detection* possible
+("orders are arriving late" / "demand stepped up").
 
-### 3.3 Decision points
+### 4.2 Policy interface
 
-A decision exists when a machine is **idle, up, and its stage queue is non-empty**.
-Triggers: release into a queue, operation complete (frees the machine and may feed
-a downstream queue), repair.
+```python
+def policy(obs: dict) -> list[int]: ...
+```
 
-- **Simultaneous decisions**: resolved in ascending machine id. After each
-  assignment the remaining candidates are recomputed (a job taken by M1 disappears
-  from M2's set).
-- **Work-conserving**: if work exists, something is dispatched. Limitation, stated
-  openly: the policy cannot learn strategic idling (e.g. waiting for an urgent job
-  to arrive).
-- **Trivial decisions** (exactly 1 candidate) are auto-applied for every policy and
-  never reach the agent. Cost still accrues through elapsed time. This keeps PPO
-  steps meaningful and changes no policy's outcome.
+**Stateless.** Memory lives in the obs history windows. This keeps programs pure,
+deterministic, replayable, and easy to sandbox. Any history a policy needs must fit
+the window — a stated limitation.
 
-### 3.4 Failures
-
-- Per-machine failures on **calendar time** (exponential TTF, lognormal TTR),
-  pre-sampled per machine.
-- A failure during processing **preempts and resumes**: remaining work continues on
-  the same machine after repair. No scrap and no rework in the MVP.
-- A failure while idle just makes the machine unavailable.
-
-Calendar-time failures are a choice made for paired evaluation: failure timing then
-does not depend on policy. Busy-time failures are more realistic but couple
-disturbances to the policy. That can be a later ablation.
-
-### 3.5 Setups
-
-Sequence-dependent: a setup of `s_m` minutes is incurred when machine `m` switches
-product family. Initial setup state = "none" (the first job always pays it, or we
-seed initial states — decide in config).
-
-### 3.6 Event log
-
-Every state change is one typed `EventRecord(time, kind, machine, job, op, detail)`.
-The log is the ground truth for metrics, tests, the Gantt chart, and debugging.
-Metrics are computed **from the log**, not from counters spread through the sim.
+Output validation is strict: wrong length, non-int, negative, or > `q_max` makes the
+episode **invalid** (not silently clipped). Validity rate is a reported metric.
 
 ---
 
-## 4. Randomness and common random numbers (paired evaluation)
+## 5. Policies compared
 
-All exogenous randomness is sampled **before** the simulation starts into a
-`ScenarioInstance`:
+All policies are tuned / trained / searched on the **train family only**, with
+hyperparameter selection on train-family **validation** scenes. Nobody touches
+held-out families before final evaluation.
 
-| Source | Sampled as | Keyed by |
+| Policy | Role | Notes |
 |---|---|---|
-| Arrivals, families, weights, due dates | full job list | scenario seed, stream "jobs" |
-| Processing time noise | multiplier `ε_{j,o}` per (job, op) | stream "proc" |
-| Failures | (fail time, repair duration) list per machine | stream "fail:{m}" |
+| Static base-stock | Textbook floor | Order-up-to `S_i`, capacity-aware scaling; safety factor tuned hard on train |
+| Static (s,S) | Textbook floor | Handles fixed cost `K`; tuned on train |
+| Capped base-stock | Strong lost-sales heuristic | Order-up-to with a per-order cap (Xin 2021); the baseline recent LLM-inventory work (InvEvolve) compares against |
+| **Adaptive base-stock** | Strong classical | Rolling estimates of μ, σ, L from the obs windows, recomputed daily |
+| Hindsight oracle | Ceiling (heuristic) | Per-scene, see §5.2 |
+| PPO | Neural RL | §6 |
+| Zero-shot LLM | Prior knowledge | Frontier API model + the small base model |
+| Program search | LLM evolution | FunSearch-style, §7.2 |
+| Small LLM, SFT + GRPO | Main contribution | §7.3 |
 
-Realized duration = `mean(op, machine) / speed(machine) · ε_{j,o}`. Because noise
-is per (job, op) and not drawn "on the next call to rng", **dispatch order cannot
-change what randomness a job gets**. Every policy faces exactly the same jobs and
-disturbances. Streams come from `numpy.random.SeedSequence(seed).spawn(...)`.
+### 5.1 Why adaptive base-stock is mandatory
 
-Consequence: the simulator itself is deterministic given an instance. Same instance
-+ same policy ⇒ byte-identical event log (a test).
+The headline claim is "programs detect shocks and adapt". The obvious reviewer
+objection is "so would a textbook policy that re-estimates demand and lead time on
+a rolling window". Without this baseline a win on held-out shocks is not credible.
+"Floor" in every table = the best of the four classical policies on train
+validation.
 
----
-
-## 5. Candidates, observation, action
-
-### 5.1 Candidate set (shared by ALL policies)
-
-Candidates for machine `m` = jobs waiting at `m`'s stage whose current op is
-eligible on `m`, sorted canonically by `(queue_entry_time, job_id)` and truncated to
-`K` slots.
-
-- Rules choose from the **same** truncated set as PPO, so truncation cannot
-  quietly be the real scheduler.
-- `K` is chosen so truncation is rare at nominal load (start with K=16). We log the
-  **truncation rate** as a metric; if it is non-trivial in a scenario, the results
-  for that scenario come with a caveat.
-
-### 5.2 Observation (no future leakage)
-
-- **Machine block**: stage one-hot, current setup family one-hot, speed.
-- **Candidate table `K × F`** per slot: family one-hot, *expected* proc time on m,
-  setup-needed flag, weight, slack = `d_j − t − expected remaining work`, time in
-  queue, remaining ops, is-re-entrant flag, downstream queue length for its next
-  stage.
-- **Global block**: WIP, queue length per stage, machines up/down per stage, fraction
-  of release window elapsed.
-- **Mask**: `K` booleans.
-
-Never observed: realized `ε`, future failures, future arrivals.
-
-Features are normalised with fixed scales derived from the config (not running
-statistics). That makes serving deterministic, and the scales are versioned with
-the model.
-
-`features.py` is the only place features are built. The Gym env and the API both
-import it. This is the training/serving parity guarantee.
-
-Known limitation: a flat MLP over ordered slots can learn position bias. Later
-improvement: a permutation-invariant scorer (a shared MLP per candidate → logits).
-Don't do it in the MVP; measure first.
-
-### 5.3 Action
-
-`Discrete(K)` = slot index, with invalid slots masked (`MaskablePPO`,
-`action_masks()`). Invalid-action rate is still tracked: it must be 0, and the
-metric proves it.
-
----
-
-## 6. Objective and reward
-
-### 6.1 Objective (minimise)
+### 5.2 Oracle and "% gap closed"
 
 ```
-J = α Σ_j (C_j − A_j)  +  β Σ_j w_j · max(0, C_j − d_j)  +  λ Σ_k s_k
+gap_closed(π) = (cost_floor − cost_π) / (cost_floor − cost_oracle)
 ```
 
-(The setup weight is λ, not γ, to avoid a clash with the RL discount γ.)
+- Oracle = (s,S) per SKU tuned on the **realised** scene with hindsight, jointly
+  under the capacity constraint (coordinate descent).
+- On shock scenes the oracle is **piecewise**: separate (s,S) before and after the
+  known change point. A single static (s,S) is not a ceiling for an adaptive
+  policy on a regime shift.
+- It is still a heuristic, not a true optimum. **Values > 100% are possible and are
+  reported, not clipped.**
+- If `cost_floor − cost_oracle` is < 2% of floor cost on a scene family, % gap is
+  unstable there: report raw relative cost instead and flag it.
 
-### 6.2 Exact incremental reward
+---
 
-Define the partial cost at time t over released jobs:
+## 6. PPO
+
+- Same obs, flattened, normalised with fixed config-derived scales.
+- Action: `MultiDiscrete` per SKU, order quantity in 16 bins spanning
+  `[0, 2 · μ_i · (L̄_i + 1)]`.
+- `sb3` PPO, vectorised envs sampling train-family seeds, ≥5 training seeds.
+- Two variants: **PPO-stable** (train family only, same data as everyone else) and
+  **PPO-randomised** (domain randomisation over demand level / lead-time mean, still
+  excluding the held-out shock *shapes*). Without the second, "PPO degrades on
+  shocks" is true by construction.
+- Reward = negative daily cost / fixed scale (sums to −episode cost / scale).
+- Gets the same tuning budget discipline as everything else: validation scenes only.
+
+---
+
+## 7. LLM pipeline
+
+### 7.1 Prompt
+
+The prompt describes the **environment spec** (costs, capacity, number of SKUs,
+nominal lead times, obs schema, function signature) — drawn from a distribution of
+train-family configs so prompts vary. It never mentions held-out shock types. The
+LLM's pretrained knowledge that disruptions exist is part of the hypothesis, and the
+writeup says so.
+
+### 7.2 Program search (FunSearch-style)
+
+- Islands of programs; each step prompts the LLM with 2 parents + scores, asks for
+  an improved program; keep if it beats the island's worst.
+- Fitness = verifier score on a **fixed pool of train scenes** (CRN).
+- Dedupe by normalised AST hash.
+- Budget counted in **verifier evaluations**, so methods are compared at matched
+  budget.
+- Run with the frontier API model; also run with the small base model, to separate
+  "the search" from "the teacher model".
+
+### 7.3 SFT + GRPO
+
+- **SFT**: LoRA on Qwen-coder 1.5B → 7B, on deduplicated top programs from search,
+  paired with varied environment-spec prompts. Goal: valid, reasonable code from
+  the start. Track diversity so GRPO does not start collapsed.
+- **GRPO**: TRL `GRPOTrainer` + vLLM generation, LoRA, group size 8.
+  Reward per completion = mean over **S fresh train scenes** (default 8) of
+  `clip((cost_base − cost_π) / cost_base, −1, 1)`; invalid or timed-out program = −1.
+  Baseline = tuned static base-stock, costs cached per scene in a fixed pool.
+- Needs a Linux GPU box. Not feasible on the Mac.
+
+### 7.4 Decoding protocol
+
+- **Greedy**: one program at temperature 0.
+- **Sampled best-of-k**: k programs, the best on **validation** scenes is selected,
+  then evaluated on held-out. Selection never sees held-out.
+- Report both, plus validity rate.
+
+---
+
+## 8. Verifier and sandbox
+
+The verifier runs untrusted model-written code and its score is the reward, so it
+is a security boundary *and* a reward-hacking boundary.
+
+- **Sim stays in the trusted parent.** The sandboxed child receives only obs dicts
+  and returns orders. It never holds the scene, so it cannot read future demand.
+- **Static checks** (AST): imports allowlisted (`math`, `statistics`); no dunder
+  attribute access, no `eval/exec/open/compile/globals/getattr/__import__`.
+- **Runtime limits**: per-call and per-episode time budget, memory rlimit, CPU
+  rlimit, no network (container `--network none` on the training box).
+- **Batching**: one IPC round-trip per day carries obs for a batch of scenes, so
+  sandboxing does not kill throughput.
+- **Adversarial test suite**: programs that try imports, introspection, infinite
+  loops, huge allocations, invalid outputs, mutation of obs, "never order",
+  "flood the warehouse". Each must be blocked or scored correctly.
+- Human-written code in the game is local-only unless a real container sandbox
+  (e.g. gVisor) is in place.
+
+Throughput target: **≥ 2,000 episodes/min** (N=8, T=365) for trusted policies on
+one core. Measured in Phase 0, vectorised with numpy only if missed.
+
+---
+
+## 9. Scene families
+
+| Family | Split | Definition |
+|---|---|---|
+| `stable` | train / val / in-dist test | Negative-binomial demand around μ_i with weekly seasonality; lead time ~ nominal ± jitter |
+| `demand_spike` | held-out | At t0 ∈ [120, 240], demand mean × m (m ∈ [2, 4]) for a random SKU subset; persists |
+| `supplier_disruption` | held-out | At t0, lead-time mean silently jumps (e.g. 3 → 10 days) for a SKU subset |
+| `new_sku` | held-out (optional) | A SKU enters mid-horizon with empty history |
+
+Capacity is set so that summed base-stock targets exceed `C` by ~20–30% at nominal
+load: the coupling must bind, or the problem degenerates to N independent textbook
+problems ("sim too easy" risk).
+
+### 9.1 Frozen evaluation scenes
+
+- Val, in-dist test, and held-out test scenes are generated once, saved as `.npz`,
+  and listed in `scenes/manifest.json` with SHA-256 per file.
+- A pytest test regenerates them from seeds and checks the hashes: generator drift
+  fails the test suite.
+- Every result file records the manifest hash it was computed on.
+
+---
+
+## 10. Evaluation protocol (fixed before any training)
+
+- **Paired**: every policy on the same scenes. Report per-scene differences vs the
+  floor, mean with paired bootstrap 95% CI, win rate.
+- **Learned methods** (PPO, search, GRPO): distribution across ≥5 training seeds /
+  search runs, not the best run.
+- **Families reported separately**: in-dist test vs each held-out family.
+- **Metrics**: total cost + 5-way breakdown, fill rate, scrap units, % gap closed,
+  validity rate, invalid/timeout episodes.
+- **Matched budget** for search vs GRPO: verifier evaluations spent.
+
+---
+
+## 11. Real-trace judge (M5)
+
+- Demand traces from M5 (Walmart daily unit sales). Lead times, costs and capacity
+  stay **synthetic**, sampled from the train-family priors. The writeup says so.
+- SKU groups of N = 8 from the same store + department, filtered to items with
+  enough volume (M5 is highly intermittent).
+- **Censoring caveat**: M5 records sales, not demand. On stockout days true demand
+  is under-counted. Stated openly; optionally drop items with suspicious zero runs.
+- Output: policy ranking on M5 vs ranking in sim, **Kendall τ with bootstrap CI**.
+- License/terms of M5 data to be checked before use (Phase 1).
+
+---
+
+## 12. Game — "Run the warehouse"
+
+- Player manages 3–4 SKUs, ordering **weekly** (~26 turns, under 5 minutes).
+- Screen: on-hand, pipeline, demand chart, capacity bar, running cost breakdown.
+- A shock hits mid-game (spike or disruption), unannounced — like the held-out sets.
+- End screen: player vs base-stock vs PPO vs best LLM program on the **same scene**
+  (CRN makes it fair), with the winning program's code shown and annotated.
+- Seeded daily challenge for shareable scenes.
+- Optional local-only "write your own policy" mode, scored by the verifier.
+- Streamlit; game reuses the sim with weekly decisions wrapped over daily steps.
+
+---
+
+## 13. Repository layout
 
 ```
-J(t) = Σ_j [ α·(min(C_j,t) − A_j)  +  β·w_j·max(0, min(C_j,t) − d_j) ]  +  λ·(setup time started by t)
-```
-
-Step reward between decisions at `t_k` and `t_{k+1}`:
-`r_k = −(J(t_{k+1}) − J(t_k)) / scale`.
-
-Properties:
-- Telescopes: `Σ_k r_k = −J / scale` exactly when the episode drains. **This is
-  a unit test**, and it checks the reward against an independent metrics
-  computation from the event log.
-- Charges elapsed simulated time, not number of decisions. A policy is not
-  penalised for "more decision events".
-- Due dates crossed mid-interval are handled exactly by the `max`.
-- `scale` = a config constant (e.g. n_jobs × mean op time), versioned.
-
-Note: setup time already inflates flow time, so λ is an *extra* penalty on
-changeovers (e.g. tool wear / qualification cost). Start with λ small or 0 and treat
-it as a knob.
-
-### 6.3 Episode boundaries
-
-- Arrivals stop at `T_release`. The sim then drains all jobs → `terminated=True`.
-- Safety cap `T_max`: `truncated=True`. Cost up to `T_max` has already been charged,
-  and unfinished jobs are reported as a metric. In evaluation, any truncated episode
-  is a failure flag, not a silently shorter run.
-
-### 6.4 Discounting (semi-MDP caveat)
-
-Decisions are unevenly spaced in time, so a per-step γ is a per-*decision* discount.
-Use γ ≈ 0.999 (near-undiscounted episodic) with GAE λ ~0.95. Time-aware
-discounting `γ^{Δt}` is a possible later ablation, not MVP.
-
----
-
-## 7. Baselines
-
-All implement `Policy.choose(decision, obs_context) -> slot`. Ties are broken by
-canonical order.
-
-| Rule | Picks |
-|---|---|
-| FIFO | earliest arrival to the current queue |
-| SPT | shortest expected proc time on this machine |
-| EDD | earliest due date |
-| ATCS | Apparent Tardiness Cost with Setups (weights, slack, setup); k₁, k₂ tuned on *train* seeds only |
-| Random | uniform over valid slots (sanity floor) |
-
-ATCS is the strong rule PPO has to beat. Tuning it only on train seeds keeps the
-comparison fair.
-
-Later: CP-SAT (OR-Tools) on small instances as a near-optimal reference, plus a
-rolling-horizon variant.
-
----
-
-## 8. Evaluation protocol (fixed before any training)
-
-- **Seed splits** (disjoint): train scenario seeds `[0, 10k)`, validation
-  `[10k, 10.1k)`, test `[20k, 20.2k)`.
-- **Training seeds**: ≥5 independent PPO runs. Report the distribution across runs,
-  not only the best run.
-- **Paired design**: every policy runs on the same test instances. Report the per-instance
-  difference vs ATCS, the mean with a bootstrap 95% CI, and the win rate.
-- **Suites**: nominal · high load · frequent failures · tight due dates · shifted
-  product mix · urgent-order injection. PPO is trained on nominal (or a mixture,
-  decided up front), and the other suites are reported as OOD.
-- **Metrics** (from the event log): weighted tardiness, on-time rate, mean and p95 flow
-  time, throughput within `[0, T_release]`, total setup time, makespan, decision
-  latency, invalid-action rate, truncation rate, timeout episodes.
-- **Ablations (Phase 5)**: remove feature groups (slack, setup flag, downstream
-  congestion), and compare K values.
-
----
-
-## 9. Training & MLOps
-
-- `sb3_contrib.MaskablePPO`, `MlpPolicy`, vectorized envs (`SubprocVecEnv`),
-  each env sampling train seeds.
-- MLflow run records: config hash, git SHA, scenario spec, obs-schema version, feature
-  scales, reward scale, hyperparameters, learning curves, periodic validation KPIs, and
-  the final checkpoint.
-- Model package = `{weights, obs_schema_version, feature_config, K, policy metadata}`.
-  The API refuses a package whose schema version does not match.
-
----
-
-## 10. Serving
-
-- **FastAPI** `POST /v1/dispatch`: the request is a raw `DecisionContext` (machine state +
-  candidate jobs + global state as Pydantic models, including `schema_version`). The server
-  builds features with the shared `features.py`, runs the frozen policy, and returns
-  `{job_id, slot, model_version, fallback_used, latency_ms}`.
-- Validation: malformed input → 422; schema/model mismatch → 409; empty candidates
-  → 422.
-- **Fallback**: the client (simulated dispatcher) uses ATCS on timeout/5xx. The
-  server uses ATCS if inference raises. Fallback use is counted.
-- `GET /healthz`, `GET /v1/model`. Prometheus-style counters (latency, fallback
-  count, action distribution) come later.
-- Docker: one image, separate entrypoints for `api`, `train`, `eval`, `dashboard`.
-  Inference never trains.
-
-## 11. Dashboard (Streamlit + Plotly)
-
-Gantt from the event log, WIP/queue-length time series, a KPI table per policy, a
-paired-difference plot with CIs, and "replay this test scenario under policy X".
-
----
-
-## 12. Repository layout
-
-```
-src/fabdispatch/
-  config.py          # Pydantic: FactoryConfig, WorkloadConfig, ScenarioSpec
-  scenario.py        # ScenarioSpec + seed -> ScenarioInstance (pre-sampled)
+src/reordergym/
+  config.py            # Pydantic: SkuParams, WarehouseConfig, ScenarioSpec
+  scenes.py            # generator, families, freeze + manifest
   sim/
-    state.py         # runtime Job/Machine state
-    events.py        # EventRecord, EventLog
-    simulator.py     # SimPy core: advance()/apply()
-  dispatch/
-    candidates.py    # canonical candidate set (shared)
-    rules.py         # FIFO, SPT, EDD, ATCS, Random
-    runner.py        # run(instance, policy) -> EventLog
-  metrics.py         # KPIs from EventLog; J(t)
-  rl/
-    features.py      # shared obs builder (env + API)
-    env.py           # FabDispatchEnv (Gymnasium)
-    train.py
+    core.py            # daily step, cost accounting
+    obs.py             # the one obs builder (all policies, game, prompts)
+  policies/
+    classical.py       # base-stock, (s,S), adaptive base-stock
+    oracle.py          # hindsight (piecewise) oracle
+    tuning.py
+  verifier/
+    sandbox.py         # AST checks, worker process, limits
+    score.py           # multi-scene reward
+  rl/ppo.py
+  llm/
+    prompts.py
+    search.py          # FunSearch-style
+    sft.py, grpo.py
   eval/
-    suites.py, evaluate.py, report.py
-  serve/
-    api.py, schemas.py, client.py
-  dashboard/app.py
+    evaluate.py, stats.py, report.py
+  real/m5.py
+  game/app.py
+scenes/                # frozen eval scenes + manifest (or regenerated + hashed)
+configs/
 tests/
-configs/             # YAML scenario specs, versioned
-docs/design.md
 ```
 
-Tooling: `uv`, Python 3.12 (safest for torch/SB3 wheels), ruff, mypy (strict on
-`src/`), pytest + hypothesis for invariants, GitHub Actions.
+Dependency groups keep the core light: core (numpy, pydantic), `rl` (sb3, torch),
+`llm` (trl, peft, vllm — Linux GPU only), `game` (streamlit, plotly).
 
 ---
 
-## 13. Invariants we test (property tests over many random seeds)
+## 14. Invariants we test
 
-1. A machine never has two overlapping processing intervals.
-2. An op never starts before the job's previous op completes.
-3. A job only runs on a machine eligible for its current op.
-4. No machine processes while down. Preempted work resumes and total processed time
-   = realized duration.
-5. Conservation: released = completed + in-system, at every event. After drain,
-   completed = released.
-6. Determinism: same instance + policy ⇒ identical event log.
-7. CRN: the realized duration of (job, op) is identical across policies.
-8. Reward telescoping: Σ rewards = −J/scale, where J comes from the event log.
-9. Hand-traced micro scenario (2 machines, ~10 jobs, deterministic): exact expected
-   schedule and tardiness for FIFO and EDD.
-10. Env: random valid actions always reach termination, and the mask always has ≥1
-    valid slot when a decision is presented.
-11. API: rejects malformed / schema-mismatched requests, and fallback triggers on
-    timeout.
+1. Hand-traced micro scene (2 SKUs, 10 days): exact receipts, scrap split, lost
+   sales and every cost component, written by hand first.
+2. Inventory conservation per SKU: start + received = sold + scrapped + end on-hand.
+3. Capacity: end-of-receipt on-hand never exceeds `C`.
+4. Determinism: same scene + policy ⇒ identical trajectory and cost.
+5. CRN: an order placed on day t always gets `lead_time[i,t]`, regardless of policy.
+6. No leakage: obs contains no `t`, `T`, future arrays, or arrival days (schema test).
+7. Newsvendor sanity: 1 SKU, lead time 1 (next-morning delivery), no fixed cost, no
+   capacity → tuned base-stock matches exhaustive search over S, and the analytic
+   critical fractile (derived in the test docstring).
+8. Uncapacitated multi-SKU → SKUs are independent (cost = sum of single-SKU runs).
+9. Verifier: adversarial suite is blocked; scores match direct trusted execution.
+10. Frozen scenes: regenerated hashes match the manifest.
+11. Cost of oracle ≤ cost of static (s,S) floor on every scene it was tuned on.
