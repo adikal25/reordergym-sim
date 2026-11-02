@@ -1,8 +1,5 @@
 # ReorderGym — Design
 
-Status: describes what is built as of November 2026. Planned work is listed in the
-last sections. The original plan is in git history (commit `4d32d13`).
-
 ## 1. Question
 
 > Can inventory policies written as code by an LLM hold up better than tuned textbook
