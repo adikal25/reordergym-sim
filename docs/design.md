@@ -61,7 +61,8 @@ max order `q_max_i`.
 1. **Receive** every outstanding order whose arrival day is `t`. Orders may cross.
 2. **Capacity check**: if total on-hand > `C`, the excess is scrapped *from today's
    receipts*, split across SKUs proportionally to today's receipt quantities
-   (largest-remainder rounding, ties by SKU index). Charged `c_i + x_i` per unit.
+   (largest-remainder rounding, ties by SKU index). Charged `x_i` per unit; the
+   purchase cost `c_i` was already paid when the order was placed.
 3. **Demand** `D[i,t]` is served from on-hand. Unmet demand is lost, charged `p_i`.
 4. **Holding** charged on end-of-day on-hand: `h_i · on_hand_i`.
 5. **Observe → decide**: the policy returns integer orders `q_i ∈ [0, q_max_i]`.
@@ -81,8 +82,10 @@ against *this* definition (§5.1). A hand-traced test pins them down.
   where the end is.
 - **Warm-up**: costs in days `[0, W)` (default W = 60) are excluded from scoring.
   Initial state: on-hand = `μ_i · (L̄_i + 1)`, empty pipeline.
-- **Terminal valuation**: at `T`, on-hand and pipeline units are credited at `c_i`,
-  so ending with inventory is neither free nor penalised beyond holding cost.
+- **Stock valuation at both ends of the scored window**: the window is charged the
+  stock it inherits from warm-up (on-hand + pipeline at end of day W−1) at `c_i`, and
+  credited the stock left at `T` at `c_i`. Inherited stock is not free, leftover
+  stock is not wasted, and only holding cost penalises carrying it.
 
 ### 2.4 Cost accounting
 
