@@ -1,7 +1,7 @@
 [project]
-name = "fabdispatch"
+name = "reordergym"
 version = "0.1.0"
-description = "Simulation-based RL dispatching for a semiconductor-inspired job shop, benchmarked against dispatching rules."
+description = "LLM-written inventory policies vs neural RL vs classical baselines on held-out supply-chain shocks."
 readme = "README.md"
 authors = [{ name = "adikal25" }]
 requires-python = ">=3.12,<3.13"

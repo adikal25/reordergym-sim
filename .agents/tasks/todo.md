@@ -16,12 +16,12 @@ Conventions for every PR:
 ## Milestone 1 — Kill test (sim + baselines + zero-shot/search LLM programs)
 
 ### PR 1 — Rename + config models
-- [ ] Rename package `fabdispatch` → `reordergym` locally (src dir, pyproject, README, tests)
-- [ ] `config.py` (frozen Pydantic):
+- [x] Rename package `fabdispatch` → `reordergym` locally (src dir, pyproject, README, tests)
+- [x] `config.py` (frozen Pydantic):
   - `SkuParams`: unit_cost, holding, lost_sales_penalty, fixed_order_cost, scrap_cost, q_max, nominal_lead_time (≥ 1)
   - `WarehouseConfig`: skus, capacity (> 0)
   - `SimConfig`: horizon T, warmup W < T, demand_history H, lead_time_history M
-- [ ] Tests: validators reject L = 0, W ≥ T, empty SKU list
+- [x] Tests: validators reject L = 0, W ≥ T, empty SKU list
 - DoD: CI green under the new name
 
 ### PR 2 — Scene generator (CRN)

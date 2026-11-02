@@ -131,8 +131,7 @@ Never observed: `t`, `T`, future demand, future lead times, the scene family.
 ### 4.2 Policy interface
 
 ```python
-def policy(obs: dict) -> list[int]:
-    ...
+def policy(obs: dict) -> list[int]: ...
 ```
 
 **Stateless.** Memory lives in the obs history windows. This keeps programs pure,
