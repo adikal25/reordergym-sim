@@ -19,6 +19,22 @@ def make_grid(**axes: Sequence[float]) -> list[Params]:
     return [dict(zip(names, values, strict=True)) for values in itertools.product(*axes.values())]
 
 
+def per_scene_costs(
+    factory: PolicyFactory,
+    params: Params,
+    scenes: Sequence[Scene],
+    warehouse: WarehouseConfig,
+    warmup: int,
+) -> list[float]:
+    """Episode cost on each scene, in order. Every candidate runs on the same scenes."""
+    costs: list[float] = []
+    for scene in scenes:
+        policy = factory(warehouse, **params)
+        records = run_episode(scene, warehouse, policy, initial_on_hand=[0] * scene.n_skus)
+        costs.append(score_episode(records, warehouse, warmup).total)
+    return costs
+
+
 def mean_score(
     factory: PolicyFactory,
     params: Params,
@@ -26,13 +42,9 @@ def mean_score(
     warehouse: WarehouseConfig,
     warmup: int,
 ) -> float:
-    """Average episode cost. Every candidate runs on the same scenes (fair comparison)."""
-    total = 0.0
-    for scene in scenes:
-        policy = factory(warehouse, **params)
-        records = run_episode(scene, warehouse, policy, initial_on_hand=[0] * scene.n_skus)
-        total += score_episode(records, warehouse, warmup).total
-    return total / len(scenes)
+    """Average episode cost (fair comparison: same scenes for every candidate)."""
+    costs = per_scene_costs(factory, params, scenes, warehouse, warmup)
+    return sum(costs) / len(costs)
 
 
 @dataclass(frozen=True)
