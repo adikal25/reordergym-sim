@@ -2,21 +2,57 @@
 
 # ReorderGym
 
-LLMs that write inventory policies as code, trained against a verifier.
+A small inventory simulator for testing whether LLM-written ordering policies can match
+or beat the textbook rules, especially when demand or suppliers change unexpectedly.
 
-> Research question: on supply-chain shocks the model never trained on, do inventory
-> policies written as code by an LLM generalize better than a neural RL policy or the
-> textbook formula?
+**Run it on your laptop:** see [docs/running-locally.md](docs/running-locally.md). The
+simulator and baselines need no API key.
 
-Policies are compared on a multi-SKU warehouse simulator with shared capacity,
-lead-time jitter, lost sales, fixed order costs and scrap. Baselines include tuned
-base-stock, (s,S), adaptive base-stock, a hindsight oracle and PPO. LLM policies come
-from zero-shot prompting, FunSearch-style program search, and a small model trained
-with SFT + GRPO. Rankings are checked against real demand traces from M5.
+## What's inside
 
-## Status
+- **Simulator.** Several products share one warehouse with limited space. Demand is
+  random with a weekly rhythm, and supplier lead times vary. Each day: deliveries arrive,
+  overflow is scrapped, customers buy, unsold stock costs money overnight, and the policy
+  decides what to order. Missed sales are lost.
+- **Fair comparisons.** All randomness is drawn before a run starts, so every policy
+  faces exactly the same demand and delays.
+- **Scene families.** Stable demand, gradual drift with slower suppliers ("varied"), and
+  two held-out shocks: a sudden demand spike and a sudden supplier slowdown.
+- **Classical baselines.** Base-stock, (s,S), capped base-stock and adaptive
+  base-stock, tuned by grid search on training scenes only.
+- **LLM policies.** An LLM writes the policy as a plain Python function. The code runs
+  with guardrails: limited imports, a time limit, and checks on every order.
+- **Program search.** A small evolutionary loop shows the LLM strong programs and their
+  costs, asks for a better one, and keeps valid improvements.
+- **Statistics.** Paired bootstrap confidence intervals and win rates against the best
+  baseline in each family.
 
-Early design. See [`docs/design.md`](docs/design.md).
+## Planned
+
+A hindsight oracle as a cost ceiling, a PPO baseline, and a check on real demand data.
+The full design is in [docs/design.md](docs/design.md).
+
+## Repository layout
+
+```
+src/reordergym/
+  config.py       product, warehouse and simulation settings
+  scene.py        a pre-drawn year of demand and lead times
+  generate.py     random scene generator (stable, varied, spike, disruption)
+  sim.py          the daily simulation loop and cost accounting
+  score.py        episode score: warm-up excluded, stock valued at both ends
+  policies.py     classical baselines
+  tuning.py       grid search over baseline settings
+  llm.py          prompts, API calls and guardrails for LLM-written code
+  search.py       evolutionary program search
+  stats.py        paired bootstrap confidence intervals
+  experiment.py   shared setup for the experiment scripts
+scripts/
+  baselines.py    tune and test the classical baselines (no API key)
+  zero_shot.py    LLM-written policies vs baselines
+  search.py       program search, scored on calm or varied scenes
+tests/            hand-worked and property tests
+```
 
 ## Development
 
