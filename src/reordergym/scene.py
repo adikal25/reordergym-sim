@@ -6,7 +6,7 @@ from typing import Literal
 import numpy as np
 import numpy.typing as npt
 
-Family = Literal["stable", "demand_spike", "supplier_disruption"]
+Family = Literal["stable", "varied", "demand_spike", "supplier_disruption"]
 
 
 @dataclass(frozen=True)

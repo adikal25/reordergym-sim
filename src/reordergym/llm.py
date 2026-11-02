@@ -32,6 +32,14 @@ class ProgramError(Exception):
     """The program is unsafe, broken, too slow, or returned invalid orders."""
 
 
+class GenerationError(ProgramError):
+    """The model call finished without usable code. Failed calls are still billed."""
+
+    def __init__(self, message: str, cost_usd: float) -> None:
+        super().__init__(message)
+        self.cost_usd = cost_usd
+
+
 # --- Prompt ---------------------------------------------------------------------------
 
 
@@ -89,6 +97,21 @@ Return a list of {warehouse.n_skus} non-negative ints, each at most that SKU's m
 Reply with the complete code in one ```python block."""
 
 
+def build_improve_prompt(base_prompt: str, parents: list[tuple[str, float]]) -> str:
+    """The base task plus existing programs and their costs; ask for a better one."""
+    shown = "\n\n".join(
+        f"### Policy {chr(ord('A') + i)} (average cost per simulated year: {cost:,.0f})\n"
+        f"```python\n{code.strip()}\n```"
+        for i, (code, cost) in enumerate(parents)
+    )
+    return (
+        f"{base_prompt}\n\n## Existing policies\n"
+        "These policies were already tried. Lower cost is better. Write a NEW policy with\n"
+        "lower cost: combine their ideas, fix their weaknesses, or try something different.\n\n"
+        f"{shown}"
+    )
+
+
 # --- Calling the model ----------------------------------------------------------------
 
 
@@ -112,25 +135,34 @@ def extract_code(text: str) -> str:
     return str(blocks[-1])
 
 
-def write_policy(client: anthropic.Anthropic, prompt: str) -> GeneratedProgram:
-    response = client.beta.messages.create(
+def write_policy(
+    client: anthropic.Anthropic, prompt: str, max_tokens: int = 32000
+) -> GeneratedProgram:
+    # Streaming avoids HTTP timeouts on long responses (thinking + code).
+    with client.beta.messages.stream(
         model=MODEL,
-        max_tokens=16000,
+        max_tokens=max_tokens,
         output_config={"effort": "high"},
         betas=["server-side-fallback-2026-07-01"],
         fallbacks="default",
         messages=[{"role": "user", "content": prompt}],
-    )
-    if response.stop_reason == "refusal":
-        raise ProgramError("model declined the request")
-    if response.stop_reason == "max_tokens":
-        raise ProgramError("response hit max_tokens before finishing")
+    ) as stream:
+        response = stream.get_final_message()
     text = "".join(block.text for block in response.content if block.type == "text")
-    return GeneratedProgram(
-        code=extract_code(text),
+    program = GeneratedProgram(
+        code="",
         input_tokens=response.usage.input_tokens,
         output_tokens=response.usage.output_tokens,
     )
+    if response.stop_reason == "refusal":
+        raise GenerationError("model declined the request", program.cost_usd)
+    if response.stop_reason == "max_tokens":
+        raise GenerationError("response hit max_tokens before finishing", program.cost_usd)
+    try:
+        code = extract_code(text)
+    except ProgramError as error:
+        raise GenerationError(str(error), program.cost_usd) from error
+    return GeneratedProgram(code, program.input_tokens, program.output_tokens)
 
 
 # --- Loading the program safely -------------------------------------------------------

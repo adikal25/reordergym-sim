@@ -27,6 +27,15 @@ def generate_scene(warehouse: WarehouseConfig, horizon: int, family: Family, see
     if family == "stable":
         return Scene(demand=demand, lead_time=lead_time, family=family)
 
+    if family == "varied":
+        # Training variety that never uses the held-out shock shapes: demand drifts
+        # gradually over the year, and suppliers run slower than nominal from day 0.
+        end_level = rng.uniform(0.6, 1.6, size=n_skus)
+        trend = np.linspace(1.0, end_level, horizon, axis=1)
+        demand = rng.poisson(mean_demand * trend)
+        lead_time = lead_time + rng.integers(0, 4, size=n_skus)[:, None]
+        return Scene(demand=demand, lead_time=lead_time, family=family)
+
     change_point = int(rng.integers(horizon // 3, 2 * horizon // 3))
     if family == "demand_spike":
         multiplier = rng.uniform(2, 4)

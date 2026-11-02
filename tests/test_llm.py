@@ -1,7 +1,14 @@
 import pytest
 
 from reordergym.config import WarehouseConfig
-from reordergym.llm import ProgramError, check_program, extract_code, load_policy, time_limit
+from reordergym.llm import (
+    ProgramError,
+    build_improve_prompt,
+    check_program,
+    extract_code,
+    load_policy,
+    time_limit,
+)
 from reordergym.sim import Observation
 from tests.test_sim import SKU
 
@@ -70,3 +77,10 @@ def test_infinite_loop_times_out() -> None:
     policy = load_policy("def policy(obs):\n    while True:\n        pass", WAREHOUSE)
     with pytest.raises(ProgramError), time_limit(0.2):
         policy(OBS)
+
+
+def test_improve_prompt_shows_parents_and_costs() -> None:
+    prompt = build_improve_prompt("BASE", [("def policy(obs): return [1]", 1234.0), (GOOD, 99.0)])
+    assert prompt.startswith("BASE")
+    assert "Policy A (average cost per simulated year: 1,234)" in prompt
+    assert "Policy B (average cost per simulated year: 99)" in prompt
